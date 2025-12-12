@@ -26,17 +26,71 @@ CORS(app)  # Enable CORS for Node.js backend communication
 
 # Get environment variables from .env
 MONGODB_URI = os.getenv("MONGODB_URI")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
+
+# Validate critical environment variables
+if not MONGODB_URI:
+    print("WARNING: MONGODB_URI not set!")
+if not OPENAI_API_KEY:
+    print("WARNING: OPENAI_API_KEY not set!")
 
 # Suppress deprecation warnings
 warnings.filterwarnings('ignore', category=DeprecationWarning)
 
-# Load HuggingFace model
-print("Loading HuggingFace model...")
-hf_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+# Lazy load heavy resources
+hf_model = None
+mongo_client = None
+tavily = None
+llm = None
+graph = None
 
-# Create a single MongoDB client to reuse
-from pymongo import MongoClient
-mongo_client = MongoClient(MONGODB_URI, maxPoolSize=10, minPoolSize=1, serverSelectionTimeoutMS=5000)
+def initialize_models():
+    """Initialize models and connections on first use"""
+    global hf_model, mongo_client, tavily, llm, graph
+    
+    if hf_model is None:
+        print("Loading HuggingFace model...")
+        try:
+            hf_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+            print("HuggingFace model loaded successfully")
+        except Exception as e:
+            print(f"Error loading HuggingFace model: {e}")
+    
+    if mongo_client is None and MONGODB_URI:
+        print("Connecting to MongoDB...")
+        try:
+            from pymongo import MongoClient
+            mongo_client = MongoClient(MONGODB_URI, maxPoolSize=10, minPoolSize=1, serverSelectionTimeoutMS=5000)
+            print("MongoDB connected successfully")
+        except Exception as e:
+            print(f"Error connecting to MongoDB: {e}")
+    
+    if llm is None:
+        print("Initializing LLM...")
+        try:
+            llm = ChatOpenAI()
+            print("LLM initialized successfully")
+        except Exception as e:
+            print(f"Error initializing LLM: {e}")
+    
+    if tavily is None:
+        print("Initializing Tavily...")
+        try:
+            tavily = TavilySearchResults()
+            print("Tavily initialized successfully")
+        except Exception as e:
+            print(f"Error initializing Tavily: {e}")
+    
+    if graph is None:
+        print("Building LangGraph...")
+        try:
+            build_graph()
+            print("LangGraph built successfully")
+        except Exception as e:
+            print(f"Error building LangGraph: {e}")
+
+print("Flask app initialized - models will load on first request")
 
 # Cosine similarity function
 def cosine_similarity(a, b):
@@ -49,6 +103,9 @@ def search_destinations(query_text: str) -> str:
     Retrieve information using vector search to answer a user query.
     """
     try:
+        if mongo_client is None or hf_model is None:
+            initialize_models()
+        
         collection = mongo_client["destinations_db"]["destinations"]
 
         # Fetch all documents with embeddings
@@ -80,72 +137,82 @@ def search_destinations(query_text: str) -> str:
     except Exception as e:
         return f"Error searching destinations: {str(e)}"
 
-# Tavily Search Tool
-tavily = TavilySearchResults()
+# Build graph function
+def build_graph():
+    """Build the LangGraph workflow"""
+    global graph, llm, tavily
+    
+    # Initialize tavily if not done
+    if tavily is None:
+        tavily = TavilySearchResults()
+    
+    # Prepare tools
+    tools = [search_destinations, tavily]
+    
+    # Initialize the LLM if not done
+    if llm is None:
+        llm = ChatOpenAI()
+    
+    # Create prompt template
+    prompt = ChatPromptTemplate.from_messages([
+        {
+            "role": "system",
+            "content": """
+            <role>
+            You are a helpfull chatbot in a Sri Lankan based trip planning and travelling application. Users can book trips, explore information about
+            travelling desntinations in sri lank, explore hotels, restaurants, villas and tourist guides in sri lanka. Your task is to provide meaning full answers
+            for the questions asked by users. To answer question you can use your knowledge about that particular location, or if you need some specific information
+            you have been provided some tools as well. You can use those tools and provide an meaning full answer to the user.
+            <role/>
 
-# Prepare tools
-tools = [search_destinations, tavily]
+            <instruction>
+            Follow the below instructions when you are ansering an question.
+            * Your answer should always supportive to the sri lanka tourism industry. Never provide any negative answer.
+            * If the user's question is not related to Sri Lankan tourism, politely inform them that you can only assist with tourism-related questions about Sri Lanka.
+            * If the tools provide insufficient information, you can use your own knowledge to answer the question.
+            * When providing the answer always give the answer as a passage. Never provide unnecessary tags or formats. Just provide as a passage.
+            * The message should me neither too long nor too short. Always provide a medium sized answer that is easy to read.
+            </instruction>
 
-# Initialize the LLM
-llm = ChatOpenAI()
+            #Guadrails
+            * Always answer to the sri lanka tourism related questions. Newver divert from the main topic.
+            """
+        },
+        MessagesPlaceholder(variable_name="messages"),
+    ])
+    
+    prompt = prompt.partial(tool_names=", ".join([tool.name for tool in tools]))
+    
+    # Prepare the LLM with tools
+    bind_tools = llm.bind_tools(tools)
+    llm_with_tools = prompt | bind_tools
+    
+    # Define the graph state
+    class GraphState(TypedDict):
+        messages: Annotated[list, add_messages]
+    
+    # Node definition
+    def tool_calling_llm(state: GraphState):
+        return {"messages": [llm_with_tools.invoke(state["messages"])]}
+    
+    # Initialize memory
+    memory = MemorySaver()
+    
+    # Build the graph
+    graph_builder = StateGraph(GraphState)
+    graph_builder.add_node("tool_calling_llm", tool_calling_llm)
+    graph_builder.add_node("tools", ToolNode(tools))
+    
+    graph_builder.add_edge(START, "tool_calling_llm")
+    graph_builder.add_conditional_edges("tool_calling_llm", tools_condition)
+    graph_builder.add_edge("tools", "tool_calling_llm")
+    
+    # Compile the graph
+    graph = graph_builder.compile(checkpointer=memory)
+    return graph
 
-# Create prompt template
-prompt = ChatPromptTemplate.from_messages([
-    {
-        "role": "system",
-        "content": """
-        <role>
-        You are a helpfull chatbot in a Sri Lankan based trip planning and travelling application. Users can book trips, explore information about
-        travelling desntinations in sri lank, explore hotels, restaurants, villas and tourist guides in sri lanka. Your task is to provide meaning full answers
-        for the questions asked by users. To answer question you can use your knowledge about that particular location, or if you need some specific information
-        you have been provided some tools as well. You can use those tools and provide an meaning full answer to the user.
-        <role/>
-
-        <instruction>
-        Follow the below instructions when you are ansering an question.
-        * Your answer should always supportive to the sri lanka tourism industry. Never provide any negative answer.
-        * If the user's question is not related to Sri Lankan tourism, politely inform them that you can only assist with tourism-related questions about Sri Lanka.
-        * If the tools provide insufficient information, you can use your own knowledge to answer the question.
-        * When providing the answer always give the answer as a passage. Never provide unnecessary tags or formats. Just provide as a passage.
-        * The message should me neither too long nor too short. Always provide a medium sized answer that is easy to read.
-        </instruction>
-
-        #Guadrails
-        * Always answer to the sri lanka tourism related questions. Newver divert from the main topic.
-        """
-    },
-    MessagesPlaceholder(variable_name="messages"),
-])
-
-prompt = prompt.partial(tool_names=", ".join([tool.name for tool in tools]))
-
-# Prepare the LLM with tools
-bind_tools = llm.bind_tools(tools)
-llm_with_tools = prompt | bind_tools
-
-# Define the graph state
-class GraphState(TypedDict):
-    messages: Annotated[list, add_messages]
-
-# Node definition
-def tool_calling_llm(state: GraphState):
-    return {"messages": [llm_with_tools.invoke(state["messages"])]}
-
-# Initialize memory
+# Initialize memory globally for context API
 memory = MemorySaver()
-
-# Build the graph
-print("Building LangGraph...")
-graph_builder = StateGraph(GraphState)
-graph_builder.add_node("tool_calling_llm", tool_calling_llm)
-graph_builder.add_node("tools", ToolNode(tools))
-
-graph_builder.add_edge(START, "tool_calling_llm")
-graph_builder.add_conditional_edges("tool_calling_llm", tools_condition)
-graph_builder.add_edge("tools", "tool_calling_llm")
-
-# Compile the graph
-graph = graph_builder.compile(checkpointer=memory)
 
 print("Flask app is ready!")
 
@@ -166,6 +233,10 @@ def chat():
     }
     """
     try:
+        # Initialize models on first request
+        if graph is None:
+            initialize_models()
+        
         data = request.json
         
         # Validate input
@@ -248,6 +319,10 @@ def query_context():
     }
     """
     try:
+        # Initialize LLM if needed
+        if llm is None:
+            initialize_models()
+        
         data = request.json
         
         # Validate input
