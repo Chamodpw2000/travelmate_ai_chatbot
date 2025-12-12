@@ -232,6 +232,148 @@ def reset_conversation():
             "status": "error"
         }), 500
 
+@app.route('/query-context', methods=['POST'])
+def query_context():
+    """
+    Extract answers from provided context data using OpenAI with conversation memory
+    Expected JSON format:
+    {
+        "context": "Accommodations",
+        "contextData": [
+            {"name": "Hotel A", "location": "Colombo", "rating": 4.5, "price": 100},
+            {"name": "Hotel B", "location": "Kandy", "rating": 4.0, "price": 80}
+        ],
+        "question": "What are the available hotels in the platform?",
+        "thread_id": "user_123"  // Optional, defaults to "default_context"
+    }
+    """
+    try:
+        data = request.json
+        
+        # Validate input
+        if not data:
+            return jsonify({"error": "Request body is required"}), 400
+        
+        if 'question' not in data:
+            return jsonify({"error": "Question is required"}), 400
+        
+        if 'contextData' not in data:
+            return jsonify({"error": "Context data is required"}), 400
+        
+        question = data['question']
+        context_data = data['contextData']
+        context_type = data.get('context', 'general')
+        thread_id = data.get('thread_id', 'default_context')
+        
+        # Detect if question is asking about a different context
+        question_lower = question.lower()
+        context_keywords = {
+            'Accommodations': ['hotel', 'accommodation', 'stay', 'room', 'lodge', 'resort', 'villa', 'guesthouse'],
+            'Restaurants': ['restaurant', 'food', 'eat', 'dining', 'cuisine', 'meal', 'cafe', 'eatery'],
+            'Guides': ['guide', 'tour guide', 'tourist guide', 'travel guide'],
+            'Destinations': ['destination', 'place', 'location', 'attraction', 'site', 'visit', 'tourist spot'],
+            'Transportation': ['transport', 'transportation', 'vehicle', 'car', 'bus', 'train', 'taxi', 'ride', 'driver', 'rental', 'hire']
+        }
+        
+        # Check if question mentions a different context
+        detected_contexts = []
+        for ctx, keywords in context_keywords.items():
+            if any(keyword in question_lower for keyword in keywords):
+                detected_contexts.append(ctx)
+        
+        # If question clearly asks about a different context, suggest switching
+        if detected_contexts and context_type not in detected_contexts and len(detected_contexts) == 1:
+            suggested_context = detected_contexts[0]
+            return jsonify({
+                "response": f"It looks like you're asking about {suggested_context}, but the current context is set to {context_type}. Please switch to the correct context ({suggested_context}) to get accurate information about that data.",
+                "context": context_type,
+                "suggested_context": suggested_context,
+                "status": "context_mismatch",
+                "thread_id": thread_id
+            }), 200
+        
+        # Convert context data to string format for better readability
+        import json
+        context_str = json.dumps(context_data, indent=2)
+        
+        # Escape curly braces to prevent template variable errors
+        # Replace { with {{ and } with }} for proper escaping
+        context_str_escaped = context_str.replace('{', '{{').replace('}', '}}')
+        
+        # Create a context-aware prompt
+        system_message = f"""You are a helpful assistant for a Sri Lankan tourism platform called TravelMate. 
+You have been provided with information about {context_type} available on the platform.
+Your task is to answer user questions based on the provided data.
+
+**Response Guidelines:**
+- Answer in a clear, natural conversational manner
+- For list queries: Provide an overview with key highlights of each item
+- For specific queries: Focus on relevant details that answer the question
+- Format as readable passages, never raw JSON or data dumps
+- Mention key details: names, locations, prices, ratings, contact info
+- Use proper formatting: organize information logically
+- If asking about availability, mention available status when relevant
+- If asking about prices, clearly state the price range or per-person cost
+- If asking about ratings, mention the rating out of 5
+- For contact queries, provide contactNumber, email, or website if available
+- If data is insufficient to answer, politely state what's missing
+- Keep responses concise but informative (2-4 sentences per item for lists)
+- Always be supportive and positive about Sri Lankan tourism
+- Use proper Sri Lankan place names and context
+- Remember previous questions in this conversation and provide contextual follow-up answers
+- Work with whatever data structure is provided - adapt to available fields
+
+**Available Data for {context_type}:**
+{context_str_escaped}
+"""
+        
+        # Create prompt with conversation memory
+        context_prompt = ChatPromptTemplate.from_messages([
+            {"role": "system", "content": system_message},
+            MessagesPlaceholder(variable_name="messages"),
+        ])
+        
+        # Create a simple chain with memory
+        context_chain = context_prompt | llm
+        
+        # Configure with thread_id for memory
+        config = {"configurable": {"thread_id": thread_id}}
+        
+        # Create messages list with the current question
+        messages = [HumanMessage(content=question)]
+        
+        # Get conversation history from memory if exists
+        try:
+            checkpoint = memory.get(config)
+            if checkpoint and 'messages' in checkpoint:
+                # Prepend history to current messages
+                messages = checkpoint['messages'] + messages
+        except:
+            pass  # No history exists yet
+        
+        # Invoke the chain
+        response = context_chain.invoke({"messages": messages})
+        
+        # Save to memory
+        try:
+            updated_messages = messages + [AIMessage(content=response.content)]
+            memory.put(config, {"messages": updated_messages})
+        except:
+            pass  # Memory save failed, continue anyway
+        
+        return jsonify({
+            "response": response.content,
+            "context": context_type,
+            "status": "success",
+            "thread_id": thread_id
+        }), 200
+        
+    except Exception as e:
+        return jsonify({
+            "error": str(e),
+            "status": "error"
+        }), 500
+
 # Cleanup handler
 import atexit
 
